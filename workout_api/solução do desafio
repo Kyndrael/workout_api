@@ -1,0 +1,150 @@
+from fastapi import FastAPI, Query, Depends, HTTPException, status
+from typing import List, Optional
+from sqlalchemy import create_engine, Column, Integer, String
+from sqlalchemy.orm import sessionmaker, Session
+from sqlalchemy.exc import IntegrityError
+from fastapi_pagination import Page, paginate, add_pagination
+from pydantic import BaseModel
+from sqlalchemy.ext.declarative import declarative_base
+import re
+
+# Configuração do Banco de Dados
+SQLALCHEMY_DATABASE_URL = "postgresql://user:password@localhost:5432/workoutdb"
+
+engine = create_engine(SQLALCHEMY_DATABASE_URL)
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+Base = declarative_base()
+
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+# Modelo SQLAlchemy
+class Atleta(Base):
+    __tablename__ = 'atletas'
+
+    id = Column(Integer, primary_key=True, index=True)
+    nome = Column(String, index=True)
+    cpf = Column(String, unique=True, index=True)
+    centro_treinamento = Column(String)
+    categoria = Column(String)
+
+# Modelo Pydantic para resposta
+class AtletaResponse(BaseModel):
+    nome: str
+    centro_treinamento: str
+    categoria: str
+
+    class Config:
+        orm_mode = True
+
+# Funções CRUD
+def create_atleta(db: Session, nome: str, cpf: str, centro_treinamento: str, categoria: str):
+    db_atleta = Atleta(nome=nome, cpf=cpf, centro_treinamento=centro_treinamento, categoria=categoria)
+    db.add(db_atleta)
+    db.commit()
+    db.refresh(db_atleta)
+    return db_atleta
+
+def get_atletas(db: Session, nome: str = None, cpf: str = None):
+    query = db.query(Atleta)
+    
+    if nome:
+        query = query.filter(Atleta.nome.contains(nome))
+    if cpf:
+        query = query.filter(Atleta.cpf == cpf)
+    
+    return query.all()
+
+def validar_cpf(cpf: str) -> bool:
+    """Valida o formato do CPF"""
+    cpf_pattern = r"^\d{11}$"  # Simplificação da validação: 11 números
+    return bool(re.match(cpf_pattern, cpf))
+
+# FastAPI App
+app = FastAPI()
+
+# Autenticação simples - Token fictício para exemplo
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
+
+def verify_token(token: str = Depends(oauth2_scheme)):
+    if token != "meu_token_secreto":  # Validação simples
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Não autorizado")
+
+# Endpoint GET para listar atletas com filtros (nome, cpf) e paginação
+@app.get("/atletas/", response_model=Page[AtletaResponse])
+async def get_atletas_endpoint(nome: Optional[str] = None, cpf: Optional[str] = None, db: Session = Depends(get_db)):
+    atletas = get_atletas(db, nome, cpf)
+    return paginate(atletas)
+
+# Endpoint POST para adicionar um novo atleta, com verificação de CPF duplicado
+@app.post("/atletas/", response_model=AtletaResponse)
+async def add_atleta(atleta: AtletaResponse, db: Session = Depends(get_db)):
+    if not validar_cpf(atleta.cpf):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="CPF inválido."
+        )
+
+    try:
+        new_atleta = create_atleta(db, atleta.nome, atleta.cpf, atleta.centro_treinamento, atleta.categoria)
+        return new_atleta
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_303_SEE_OTHER,
+            detail=f"Já existe um atleta cadastrado com o cpf: {atleta.cpf}"
+        )
+
+# Endpoint PUT para atualizar informações de um atleta
+@app.put("/atletas/{atleta_id}/", response_model=AtletaResponse)
+async def update_atleta(atleta_id: int, atleta: AtletaResponse, db: Session = Depends(get_db)):
+    db_atleta = db.query(Atleta).filter(Atleta.id == atleta_id).first()
+    if not db_atleta:
+        raise HTTPException(status_code=404, detail="Atleta não encontrado.")
+    
+    db_atleta.nome = atleta.nome
+    db_atleta.cpf = atleta.cpf
+    db_atleta.centro_treinamento = atleta.centro_treinamento
+    db_atleta.categoria = atleta.categoria
+    db.commit()
+    db.refresh(db_atleta)
+    return db_atleta
+
+# Endpoint DELETE para excluir um atleta
+@app.delete("/atletas/{atleta_id}/", response_model=dict)
+async def delete_atleta(atleta_id: int, db: Session = Depends(get_db)):
+    db_atleta = db.query(Atleta).filter(Atleta.id == atleta_id).first()
+    if not db_atleta:
+        raise HTTPException(status_code=404, detail="Atleta não encontrado.")
+    
+    db.delete(db_atleta)
+    db.commit()
+    return {"message": "Atleta excluído com sucesso."}
+
+# Função para adicionar atletas exemplo
+def add_sample_atletas(db: Session):
+    atletas_exemplo = [
+        {"nome": "Roberto Carlos", "cpf": "12345678901", "centro_treinamento": "CrossFit Brasília", "categoria": "Iniciante"},
+        {"nome": "Marcos Guimarães", "cpf": "98765432100", "centro_treinamento": "CrossFit Rio de Janeiro", "categoria": "Intermediário"},
+        {"nome": "Lucas Perewira", "cpf": "11223344556", "centro_treinamento": "CrossFit São Paulo", "categoria": "Avançado"}
+    ]
+    
+    for atleta in atletas_exemplo:
+        try:
+            create_atleta(db, atleta["nome"], atleta["cpf"], atleta["centro_treinamento"], atleta["categoria"])
+        except IntegrityError:
+            db.rollback()  # Em caso de CPF duplicado, faz rollback
+
+# Adicionar atletas exemplo ao iniciar a aplicação
+@app.on_event("startup")
+async def startup_event():
+    db = SessionLocal()
+    add_sample_atletas(db)
+    db.close()
+
+# Inicialização da paginação
+add_pagination(app)
